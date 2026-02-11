@@ -80,7 +80,8 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 # Two-phase training (hard switch + partial freeze for "reinterpretation")
-parser.add_argument("--phase2-data-dir", type=str, default="", help="data dir for phase 2 (cluster B). If set, switch to this data after trigger; phase 1 uses default train data (cluster A).")
+parser.add_argument("--phase1-data-dir", type=str, default="", help="data dir for phase 1 (cluster A). If empty, use default train data dir.")
+parser.add_argument("--phase2-data-dir", type=str, default="", help="data dir for phase 2 (cluster B). If set, switch to this data after trigger.")
 parser.add_argument("--phase2-after-step", type=int, default=-1, help="switch to phase 2 after this step (-1 = disable step-based switch)")
 parser.add_argument("--phase2-after-loss", type=float, default=None, help="switch to phase 2 when smooth train loss drops at or below this value (optional)")
 parser.add_argument("--phase2-freeze-bottom-k", type=int, default=0, help="in phase 2, freeze bottom k transformer blocks (0 = no freeze)")
@@ -322,7 +323,7 @@ if resuming:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, data_dir=args.phase1_data_dir or None)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
@@ -396,7 +397,7 @@ use_phase2 = bool(
 phase_switched = False
 replay_loader = None  # built when we switch to phase 2 if phase2_replay_ratio > 0
 if use_phase2:
-    print0(f"Two-phase training enabled: phase 2 data dir={args.phase2_data_dir}, switch after step={args.phase2_after_step} or loss<={args.phase2_after_loss}, freeze bottom k={args.phase2_freeze_bottom_k}, replay ratio={args.phase2_replay_ratio}")
+    print0(f"Two-phase training enabled: phase 1 data dir={args.phase1_data_dir or '(default)'}, phase 2 data dir={args.phase2_data_dir}, switch after step={args.phase2_after_step} or loss<={args.phase2_after_loss}, freeze bottom k={args.phase2_freeze_bottom_k}, replay ratio={args.phase2_replay_ratio}")
 
 # Loop state (variables updated by the training loop)
 if not resuming:
@@ -422,7 +423,7 @@ else:
         if args.phase2_replay_ratio > 0:
             replay_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
                 tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
-                resume_state_dict=None, data_dir=None  # default = cluster A
+                resume_state_dict=None, data_dir=args.phase1_data_dir or None  # cluster A
             )
         if args.phase2_freeze_bottom_k > 0:
             freeze_bottom_k_blocks(orig_model, args.phase2_freeze_bottom_k)
@@ -613,7 +614,7 @@ while True:
             if args.phase2_replay_ratio > 0:
                 replay_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
-                    resume_state_dict=None, data_dir=None
+                    resume_state_dict=None, data_dir=args.phase1_data_dir or None  # cluster A
                 )
             if args.phase2_freeze_bottom_k > 0:
                 freeze_bottom_k_blocks(orig_model, args.phase2_freeze_bottom_k)
