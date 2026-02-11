@@ -104,7 +104,6 @@ def prepare_climbmix(
         "path": CLIMBMIX_REPO,
         "split": CLIMBMIX_SPLIT,
         "streaming": streaming,
-        "trust_remote_code": True,
     }
     print(f"Loading ClimbMix (streaming={streaming})...")
     ds = load_dataset(**load_kwargs)
