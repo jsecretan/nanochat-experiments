@@ -15,6 +15,7 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
+import random
 import time
 import math
 import argparse
@@ -78,6 +79,13 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Two-phase training (hard switch + partial freeze for "reinterpretation")
+parser.add_argument("--phase2-data-dir", type=str, default="", help="data dir for phase 2 (cluster B). If set, switch to this data after trigger; phase 1 uses default train data (cluster A).")
+parser.add_argument("--phase2-after-step", type=int, default=-1, help="switch to phase 2 after this step (-1 = disable step-based switch)")
+parser.add_argument("--phase2-after-loss", type=float, default=None, help="switch to phase 2 when smooth train loss drops at or below this value (optional)")
+parser.add_argument("--phase2-freeze-bottom-k", type=int, default=0, help="in phase 2, freeze bottom k transformer blocks (0 = no freeze)")
+parser.add_argument("--phase2-bottom-lr-mult", type=float, default=0.0, help="(reserved) in phase 2, LR multiplier for bottom k blocks instead of freeze; 0 = use freeze only")
+parser.add_argument("--phase2-replay-ratio", type=float, default=0.0, help="in phase 2, fraction of batches from cluster A replay (0-1, e.g. 0.05 for 5%%)")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -365,7 +373,30 @@ def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
 # -----------------------------------------------------------------------------
+# Two-phase training: hard switch + partial freeze (reinterpretation)
+def freeze_bottom_k_blocks(model, k):
+    """Freeze the bottom k transformer blocks (indices 0..k-1). model is the raw module (e.g. orig_model)."""
+    if k <= 0:
+        return
+    n_layer = model.config.n_layer
+    assert 0 <= k <= n_layer, f"freeze_bottom_k_blocks: k={k} must be in [0, n_layer={n_layer}]"
+    for i in range(k):
+        for p in model.transformer.h[i].parameters():
+            p.requires_grad = False
+    print0(f"Phase 2: froze bottom {k} transformer blocks (0..{k-1}); top {n_layer - k} blocks remain trainable.")
+
+# -----------------------------------------------------------------------------
 # Training loop
+
+# Two-phase training state
+use_phase2 = bool(
+    getattr(args, "phase2_data_dir", "") and
+    (getattr(args, "phase2_after_step", -1) >= 0 or getattr(args, "phase2_after_loss", None) is not None)
+)
+phase_switched = False
+replay_loader = None  # built when we switch to phase 2 if phase2_replay_ratio > 0
+if use_phase2:
+    print0(f"Two-phase training enabled: phase 2 data dir={args.phase2_data_dir}, switch after step={args.phase2_after_step} or loss<={args.phase2_after_loss}, freeze bottom k={args.phase2_freeze_bottom_k}, replay ratio={args.phase2_replay_ratio}")
 
 # Loop state (variables updated by the training loop)
 if not resuming:
@@ -381,6 +412,22 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    phase_switched = loop_state.get("phase_switched", False)
+    if phase_switched and use_phase2:
+        # Already in phase 2: use phase-2 data dir for main loader and re-apply freeze
+        train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+            tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+            resume_state_dict=None, data_dir=args.phase2_data_dir
+        )
+        if args.phase2_replay_ratio > 0:
+            replay_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+                resume_state_dict=None, data_dir=None  # default = cluster A
+            )
+        if args.phase2_freeze_bottom_k > 0:
+            freeze_bottom_k_blocks(orig_model, args.phase2_freeze_bottom_k)
+        x, y, dataloader_state_dict = next(train_loader)  # first batch from phase-2 data
+        print0("Resumed in phase 2 (cluster B data, bottom blocks frozen).")
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -471,6 +518,7 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "phase_switched": phase_switched,
                 },
             },
             rank=ddp_rank,
@@ -491,7 +539,11 @@ while True:
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+        # In phase 2 with replay, occasionally take a batch from cluster A
+        if phase_switched and args.phase2_replay_ratio > 0 and random.random() < args.phase2_replay_ratio:
+            x, y, _ = next(replay_loader)
+        else:
+            x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -547,6 +599,26 @@ while True:
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+
+    # Two-phase training: switch to cluster B and freeze bottom k blocks when trigger is met
+    if use_phase2 and not phase_switched:
+        step_trigger = args.phase2_after_step >= 0 and step >= args.phase2_after_step
+        loss_trigger = args.phase2_after_loss is not None and debiased_smooth_loss <= args.phase2_after_loss
+        if step_trigger or loss_trigger:
+            phase_switched = True
+            train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+                resume_state_dict=None, data_dir=args.phase2_data_dir
+            )
+            if args.phase2_replay_ratio > 0:
+                replay_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+                    tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device,
+                    resume_state_dict=None, data_dir=None
+                )
+            if args.phase2_freeze_bottom_k > 0:
+                freeze_bottom_k_blocks(orig_model, args.phase2_freeze_bottom_k)
+            print0(f"Phase 2 started at step {step} (step_trigger={step_trigger}, loss_trigger={loss_trigger}, loss={debiased_smooth_loss:.6f})")
+            wandb_run.log({"step": step, "phase2_switched": True, "phase2_trigger_loss": debiased_smooth_loss})
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
