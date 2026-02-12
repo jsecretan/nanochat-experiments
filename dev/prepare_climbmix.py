@@ -1,7 +1,7 @@
 """
 Prepare the ClimbMix dataset (OptimalScale/ClimbMix) as sharded parquets split by cluster_id.
 
-- Loads from HuggingFace (streaming to handle ~395M rows).
+- Loads from HuggingFace (downloads full dataset by default; use --streaming to stream).
 - Writes one directory per cluster_id: <output_dir>/<cluster_id>/shard_00000.parquet, ...
 - Each parquet has a single "text" column (same as base_data for dataloader compatibility).
 - Shard size and row group size match repackage_data_reference.py.
@@ -39,7 +39,7 @@ def prepare_climbmix(
     cluster_ids: Optional[List[int]] = None,
     chars_per_shard: int = DEFAULT_CHARS_PER_SHARD,
     row_group_size: int = DEFAULT_ROW_GROUP_SIZE,
-    streaming: bool = True,
+    streaming: bool = False,
     max_docs: Optional[int] = None,
 ):
     """
@@ -180,9 +180,9 @@ def main():
         help=f"Parquet row group size (default: {DEFAULT_ROW_GROUP_SIZE})",
     )
     parser.add_argument(
-        "--no-streaming",
+        "--streaming",
         action="store_true",
-        help="Load full dataset into memory (use only if you have enough RAM for ~395M rows)",
+        help="Stream from HuggingFace instead of downloading (faster start but can fail on network issues)",
     )
     parser.add_argument(
         "--max-docs",
@@ -207,7 +207,7 @@ def main():
         cluster_ids=cluster_ids,
         chars_per_shard=args.chars_per_shard,
         row_group_size=args.row_group_size,
-        streaming=not args.no_streaming,
+        streaming=args.streaming,
         max_docs=args.max_docs,
     )
 
